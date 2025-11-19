@@ -19,7 +19,7 @@ Luna gives you eight specialized sensors that work together to provide complete 
 
 ## Sensors
 
-### 🌙 Lunar Elevation
+### Lunar Elevation 
 
 Tracks how high the moon is above the horizon, measured in degrees.
 
@@ -35,7 +35,7 @@ Tracks how high the moon is above the horizon, measured in degrees.
 
 ---
 
-### 🧭 Lunar Azimuth
+### Lunar Azimuth
 
 Tracks the moon's compass direction, measured in degrees.
 
@@ -55,7 +55,7 @@ Tracks the moon's compass direction, measured in degrees.
 
 ---
 
-### 💡 Lunar Percent Illuminated
+### Lunar Percent Illuminated
 
 Shows how much of the moon's visible surface is currently lit by the sun.
 
@@ -67,7 +67,7 @@ Shows how much of the moon's visible surface is currently lit by the sun.
 
 ---
 
-### 📊 Lunar Phase Percent
+### Lunar Phase Percent
 
 Tracks where the moon is in its monthly cycle as a percentage.
 
@@ -83,7 +83,7 @@ Tracks where the moon is in its monthly cycle as a percentage.
 
 ---
 
-### 🌓 Lunar Phase
+### Lunar Phase
 
 Displays the traditional name of the current moon phase.
 
@@ -129,7 +129,7 @@ Tracks the moon's position in its cycle using degrees instead of percentages.
 
 ---
 
-### 🌅 Moonrise
+### Moonrise
 
 Shows when the moon will rise above the horizon today.
 
@@ -147,7 +147,7 @@ Shows when the moon will rise above the horizon today.
 
 ---
 
-### 🌇 Moonset
+### Moonset
 
 Shows when the moon will set below the horizon today.
 

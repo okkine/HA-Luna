@@ -607,8 +607,11 @@ class LunarPhasePercentSensor(BasePositionSensor):
 
         self._phase_percent = phase_percent
         
-        # Round to nearest integer for sensor value
-        rounded_percent = round(phase_percent) if phase_percent is not None else None
+        # Round to nearest integer for sensor value, wrapping 100% to 0%
+        if phase_percent is not None:
+            rounded_percent = round(phase_percent) % 100
+        else:
+            rounded_percent = None
         self._attr_native_value = rounded_percent
         self._attr_available = phase_percent is not None
 
@@ -625,15 +628,14 @@ class LunarPhasePercentSensor(BasePositionSensor):
             # Use rounded value to ensure consistency
             next_percent = rounded_percent + 1
             if next_percent >= 100:
-                next_percent = 0  # Wrap around at 100
-            
-            # Calculate time remaining to reach next percent
-            percent_remaining = next_percent - phase_percent
-            
-            time_to_next_percent = percent_remaining * percent_length_seconds
-            
-            # Add 1 second buffer as requested
-            next_update = now + timedelta(seconds=time_to_next_percent + 1)
+                # Wrap around: next percent is 0, which is the next new moon
+                next_percent = 0
+                next_update = next_new_moon + timedelta(seconds=1)
+            else:
+                # Calculate absolute time when moon will be at next_percent
+                # Time from previous_new_moon to next_percent
+                time_to_next_percent = next_percent * percent_length_seconds
+                next_update = previous_new_moon + timedelta(seconds=time_to_next_percent + 1)
         else:
             # Fallback to hourly if we don't have the data
             next_update = self._get_next_hour(now)
@@ -819,20 +821,17 @@ class LunarPhaseNameSensor(BasePositionSensor):
             # Get the phase name for the next threshold
             next_target_phase_name, _ = get_moon_phase(next_threshold)
             
-            # Handle wrap-around: if next_threshold < phase_percent, we need to wrap
+            # Calculate absolute time when moon will be at next_threshold
+            # Handle wrap-around: if next_threshold < phase_percent, we're wrapping to next cycle
             if next_threshold < phase_percent:
-                # Calculate time to end of cycle, then to threshold
-                percent_to_end = 100.0 - phase_percent
-                time_to_end = percent_to_end * percent_length_seconds
-                time_to_threshold = next_threshold * percent_length_seconds
-                time_to_next_threshold = time_to_end + time_to_threshold
+                # Wrapping around: next threshold is in the next cycle
+                # Time from next_new_moon to next_threshold
+                time_to_next_threshold = next_threshold * percent_length_seconds
+                next_update = next_new_moon + timedelta(seconds=time_to_next_threshold + 1)
             else:
-                # Calculate time remaining to reach next threshold
-                percent_remaining = next_threshold - phase_percent
-                time_to_next_threshold = percent_remaining * percent_length_seconds
-            
-            # Add 1 second buffer
-            next_update = now + timedelta(seconds=time_to_next_threshold + 1)
+                # Calculate absolute time from previous_new_moon to next_threshold
+                time_to_next_threshold = next_threshold * percent_length_seconds
+                next_update = previous_new_moon + timedelta(seconds=time_to_next_threshold + 1)
         else:
             # Fallback to hourly if we don't have the data
             next_update = self._get_next_hour(now)
@@ -937,15 +936,14 @@ class LunarPhaseDegreesSensor(BasePositionSensor):
             # Use rounded value to ensure consistency
             next_degree = degrees_value + 1
             if next_degree >= 360:
-                next_degree = 0  # Wrap around at 360
-            
-            # Calculate time remaining to reach next degree
-            degrees_remaining = next_degree - phase_degrees
-            
-            time_to_next_degree = degrees_remaining * degree_length_seconds
-            
-            # Add 1 second buffer as requested
-            next_update = now + timedelta(seconds=time_to_next_degree + 1)
+                # Wrap around: next degree is 0, which is the next new moon
+                next_degree = 0
+                next_update = next_new_moon + timedelta(seconds=1)
+            else:
+                # Calculate absolute time when moon will be at next_degree
+                # Time from previous_new_moon to next_degree
+                time_to_next_degree = next_degree * degree_length_seconds
+                next_update = previous_new_moon + timedelta(seconds=time_to_next_degree + 1)
         else:
             # Fallback to hourly if we don't have the data
             next_update = self._get_next_hour(now)
