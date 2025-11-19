@@ -1,4 +1,4 @@
 logger:
   default: info
   logs:
-    custom_components.sol: debug 
+    custom_components.luna: debug 
