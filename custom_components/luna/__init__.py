@@ -14,6 +14,7 @@ from homeassistant.helpers.device_registry import async_get as async_get_device_
 from .const import DOMAIN
 from .config_store import store_config_entry_data, remove_config_entry_data
 from .cache import get_lunar_events_cache_instance
+from .reversal_cache import get_reversal_cache_manager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,6 +57,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     lunar_events_cache = get_lunar_events_cache_instance(hass)
     await lunar_events_cache.initialize()
     
+    # Initialize reversal cache manager
+    reversal_cache_manager = get_reversal_cache_manager(hass)
+    await reversal_cache_manager.initialize_entry(entry.entry_id)
 
     # This creates each HA object for each platform your device requires.
     # It's done by calling the `async_setup_entry` function in each platform module.
@@ -85,6 +89,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id)
         # Clean up config store data
         remove_config_entry_data(entry.entry_id)
+        
+        # Clean up reversal cache for this entry
+        reversal_cache_manager = get_reversal_cache_manager(hass)
+        await reversal_cache_manager.remove_entry(entry.entry_id)
 
     return unload_ok
 

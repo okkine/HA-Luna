@@ -17,6 +17,28 @@ from .config_store import get_config_entry_data
 _LOGGER = logging.getLogger(__name__)
 
 
+def calculate_azimuth_derivative(az1: float, az2: float) -> float:
+    """
+    Calculate azimuth change handling wrap-around.
+    
+    Args:
+        az1: First azimuth value
+        az2: Second azimuth value
+        
+    Returns:
+        Azimuth difference with wraparound handled
+    """
+    diff = az2 - az1
+    
+    # Handle wrap-around cases
+    if diff > 180:
+        diff -= 360  # e.g., 10° - 350° = 20° (not -340°)
+    elif diff < -180:
+        diff += 360  # e.g., 350° - 10° = -20° (not 340°)
+    
+    return diff
+
+
 def get_moon_phase(phase_percent: float | None) -> tuple[str, str]:
     """
     Get the moon phase name and icon based on phase_percent.
@@ -293,7 +315,8 @@ def get_next_step(
     entry_id: str,
     hass: HomeAssistant,
     debug_flag: bool = False,
-    config_data: dict = None
+    config_data: dict = None,
+    reversal_cache: dict = None
 ) -> dict | float | None:
     """
     Calculate the next step value for elevation and azimuth updates.
@@ -459,27 +482,36 @@ def get_next_step(
         # Initialize blocks variable to prevent scope issues
         blocks = False
         
-        # Get reversal data for direction detection and reversal checking
-        try:
-            reversal_data = get_azimuth_reversals(hass, dt.date(), entry_id, config_data=config_data)
-            reversals = reversal_data.get('reversals', [])
-            base_direction = reversal_data.get('base_direction', 'positive')
-        except Exception as e:
-            # Fallback to original latitude-based logic
-            if config_data is None:
-                config_data = get_config_entry_data(entry_id)
-            latitude = config_data.get("latitude", hass.config.latitude) if config_data else hass.config.latitude
-            declination = moon_data.get('declination')
-            if declination is None:
+        # Get reversal cache
+        if reversal_cache:
+            # Use new cache system
+            from .reversal_cache import get_reversal_cache_manager
+            cache_manager = get_reversal_cache_manager(hass)
+            current_direction = cache_manager.get_current_direction(reversal_cache, dt_utc)
+            # Filter to future reversals only
+            reversals = [r for r in reversal_cache.get('reversals', []) if r['time'] > dt_utc]
+        else:
+            # Fallback: use old get_azimuth_reversals function
+            try:
+                reversal_data = get_azimuth_reversals(hass, dt.date(), entry_id, config_data=config_data)
+                reversals = reversal_data.get('reversals', [])
+                base_direction = reversal_data.get('base_direction', 'positive')
+            except Exception as e:
+                # Fallback to original latitude-based logic
+                if config_data is None:
+                    config_data = get_config_entry_data(entry_id)
+                latitude = config_data.get("latitude", hass.config.latitude) if config_data else hass.config.latitude
+                declination = moon_data.get('declination')
+                if declination is None:
+                    return None
+                base_direction = 1 if latitude > declination else -1
+                reversals = []
+            
+            # Determine current azimuth direction using reversal cache
+            try:
+                current_direction = get_current_azimuth_direction(dt_utc, base_direction, reversals)
+            except Exception as e:
                 return None
-            base_direction = 1 if latitude > declination else -1
-            reversals = []
-        
-        # Determine current azimuth direction using reversal cache
-        try:
-            current_direction = get_current_azimuth_direction(dt_utc, base_direction, reversals)
-        except Exception as e:
-            return None
         
         # Calculate next azimuth step with signed arithmetic
         signed_step = step_value * current_direction
@@ -775,7 +807,8 @@ def get_time_at_azimuth(
     entry_id: str,
     start_dt: datetime.datetime | None = None,
     search_window_hours: float = 6.0,
-    config_data: dict = None
+    config_data: dict = None,
+    reversal_cache: dict = None
 ) -> tuple[datetime.datetime | None, dict]:
     """
     Find the time when the moon will be at a specific azimuth using ternary search.
@@ -802,16 +835,26 @@ def get_time_at_azimuth(
     
     # Get cached reversal data to determine maximum search window
     try:
-        current_date = current_dt.date()
-        reversal_data = get_azimuth_reversals(hass, current_date, entry_id, config_data=config_data)
-        reversals = reversal_data.get('reversals', [])
-        
-        # Find next future reversal
-        next_reversal_time = None
-        for reversal in sorted(reversals, key=lambda r: r['time']):
-            if reversal['time'] > current_dt_utc:
-                next_reversal_time = reversal['time']
-                break
+        if reversal_cache:
+            # Use new cache system - filter to future reversals only
+            reversals = [r for r in reversal_cache.get('reversals', []) if r['time'] > current_dt_utc]
+            
+            # Find next future reversal (already filtered, so just get first)
+            next_reversal_time = None
+            if reversals:
+                next_reversal_time = reversals[0]['time']
+        else:
+            # Fallback to old system
+            current_date = current_dt.date()
+            reversal_data = get_azimuth_reversals(hass, current_date, entry_id, config_data=config_data)
+            reversals = reversal_data.get('reversals', [])
+            
+            # Find next future reversal
+            next_reversal_time = None
+            for reversal in sorted(reversals, key=lambda r: r['time']):
+                if reversal['time'] > current_dt_utc:
+                    next_reversal_time = reversal['time']
+                    break
         
         # Calculate max search window (cap at next reversal or 24 hours)
         if next_reversal_time:

@@ -2,8 +2,8 @@
     "config": {
         "step": {
             "user": {
-                "title": "Luna Configuration",
-                "description": "Choose how to configure your location for moon position tracking.",
+                "title": "Sol Configuration",
+                "description": "Choose how to configure your location for sun position tracking.",
                 "data": {
                     "location_type": "Location Type"
                 }
@@ -40,7 +40,7 @@
                 "data": {
                     "name": "Name"
                 },
-                "title": "Luna Options"
+                "title": "Sol Options"
             }
         }
     }

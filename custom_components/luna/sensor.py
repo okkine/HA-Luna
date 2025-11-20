@@ -338,6 +338,15 @@ class AzimuthSensor(BaseAzimuthSensor):
             # Update the sensor value
             self._attr_native_value = round(moon_data['azimuth'], 2) % 360
             
+            # Get reversal cache from new system
+            reversal_cache = None
+            try:
+                from .reversal_cache import get_reversal_cache_manager
+                cache_manager = get_reversal_cache_manager(self.hass)
+                reversal_cache = await cache_manager.get_reversals(self._entry_id, now)
+            except Exception as e:
+                _LOGGER.warning(f"Error loading reversal cache: {e}")
+            
             # Calculate the next azimuth step using enhanced logic with reversal cache
             next_step_info = get_next_step(
                 'azimuth',
@@ -347,35 +356,44 @@ class AzimuthSensor(BaseAzimuthSensor):
                 self._entry_id,
                 self.hass,
                 DEBUG_AZIMUTH_SENSOR,
-                config_data=config_data
+                config_data=config_data,
+                reversal_cache=reversal_cache
             )
             if isinstance(next_step_info, dict):
                 next_azimuth_target = next_step_info["azimuth"]
                 is_reversal = next_step_info.get("reversal", False)
-                reversal_time = next_step_info.get("reversal_time")
+                next_reversal_time_if_target = next_step_info.get("reversal_time")
             else:
                 next_azimuth_target = next_step_info
                 is_reversal = False
-                reversal_time = None
+                next_reversal_time_if_target = None
 
+            # Always get the next reversal time from cache (for monitoring)
+            reversal_time = None
+            if reversal_cache and reversal_cache.get('reversals'):
+                # Get first future reversal
+                now_utc = now.astimezone(timezone.utc)
+                future_reversals = [r for r in reversal_cache['reversals'] if r['time'] > now_utc]
+                if future_reversals:
+                    reversal_time = future_reversals[0]['time']
+
+            # Calculate current direction for debugging
             calculated_direction = 0
-            try:
-                current_date = now.date() if now else datetime.now().date()
-                temp_reversal_data = get_azimuth_reversals(self.hass, current_date, self._entry_id, config_data=config_data)
-                reversals = temp_reversal_data.get('reversals', [])
-                base_direction = temp_reversal_data.get('base_direction', 1)
-                now_utc = now.astimezone(timezone.utc) if now else datetime.now(timezone.utc)
-                calculated_direction = base_direction
-                for reversal in sorted(reversals, key=lambda r: r['time']):
-                    if reversal['time'] <= now_utc:
-                        calculated_direction *= -1
-                    else:
-                        break
-            except Exception as e:
-                calculated_direction = f"Error: {e}"
+            if reversal_cache:
+                try:
+                    from .reversal_cache import get_reversal_cache_manager
+                    cache_manager = get_reversal_cache_manager(self.hass)
+                    calculated_direction = cache_manager.get_current_direction(
+                        reversal_cache,
+                        now.astimezone(timezone.utc)
+                    )
+                except Exception as e:
+                    calculated_direction = f"Error: {e}"
+            else:
+                calculated_direction = "Cache not available"
 
-            if is_reversal and reversal_time is not None:
-                next_update_time = reversal_time
+            if is_reversal and next_reversal_time_if_target is not None:
+                next_update_time = next_reversal_time_if_target
                 search_metrics = {"info": "Next target is a reversal; using cached reversal time."}
             else:
                 # Only pass a float to get_time_at_azimuth
@@ -392,7 +410,8 @@ class AzimuthSensor(BaseAzimuthSensor):
                     self._entry_id,
                     None,  # start_dt
                     0.167,  # search_window_hours (10 minutes)
-                    config_data=config_data
+                    config_data=config_data,
+                    reversal_cache=reversal_cache
                 )
             
             # Handle calculation failure
@@ -404,17 +423,26 @@ class AzimuthSensor(BaseAzimuthSensor):
             # Let the exception propagate so we can debug it
             raise
         
-        # Get reversal cache data for today (separate try/catch to ensure attributes are always set)
-        try:
-            current_date = now.date() if now else datetime.now().date()
-            reversal_data = get_azimuth_reversals(self.hass, current_date, self._entry_id, config_data=config_data)
-        except Exception as e:
+        # Format reversal cache data for attributes
+        if reversal_cache:
             reversal_data = {
-                'reversals': [],
-                'is_tropical': False,
-                'min_azimuth': 0,
-                'max_azimuth': 360,
-                'error': str(e)
+                'last_known_state': {
+                    'time': reversal_cache['last_known_state']['time'].isoformat(),
+                    'direction': reversal_cache['last_known_state']['direction']
+                },
+                'future_reversals': [
+                    {
+                        'time': r['time'].isoformat(),
+                        'azimuth': r['azimuth']
+                    }
+                    for r in reversal_cache.get('reversals', [])
+                ],
+                'cache_source': 'new_persistent_system'
+            }
+        else:
+            reversal_data = {
+                'cache_source': 'not_available',
+                'error': 'Reversal cache not loaded'
             }
         
         # Store all moon position data as attributes, including next target and update time
