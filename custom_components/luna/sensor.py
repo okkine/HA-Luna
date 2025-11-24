@@ -370,12 +370,22 @@ class AzimuthSensor(BaseAzimuthSensor):
 
             # Always get the next reversal time from cache (for monitoring)
             reversal_time = None
-            if reversal_cache and reversal_cache.get('reversals'):
-                # Get first future reversal
+            if reversal_cache:
                 now_utc = now.astimezone(timezone.utc)
-                future_reversals = [r for r in reversal_cache['reversals'] if r['time'] > now_utc]
-                if future_reversals:
-                    reversal_time = future_reversals[0]['time']
+                # Handle both old and new cache formats during migration
+                if 'checkpoints' in reversal_cache:
+                    # New checkpoint format
+                    future_reversals = [
+                        cp for cp in reversal_cache['checkpoints'] 
+                        if cp['time'] > now_utc and cp.get('is_reversal', False)
+                    ]
+                    if future_reversals:
+                        reversal_time = future_reversals[0]['time']
+                elif 'reversals' in reversal_cache:
+                    # Old format (during migration)
+                    future_reversals = [r for r in reversal_cache['reversals'] if r['time'] > now_utc]
+                    if future_reversals:
+                        reversal_time = future_reversals[0]['time']
 
             # Calculate current direction for debugging
             calculated_direction = 0
@@ -423,26 +433,59 @@ class AzimuthSensor(BaseAzimuthSensor):
             # Let the exception propagate so we can debug it
             raise
         
-        # Format reversal cache data for attributes
+        # Format checkpoint cache data for attributes
+        _LOGGER.debug(f"Reversal cache for {self._entry_id}: type={type(reversal_cache)}, is_none={reversal_cache is None}")
         if reversal_cache:
-            reversal_data = {
-                'last_known_state': {
-                    'time': reversal_cache['last_known_state']['time'].isoformat(),
-                    'direction': reversal_cache['last_known_state']['direction']
-                },
-                'future_reversals': [
-                    {
-                        'time': r['time'].isoformat(),
-                        'azimuth': r['azimuth']
-                    }
-                    for r in reversal_cache.get('reversals', [])
-                ],
-                'cache_source': 'new_persistent_system'
-            }
+            _LOGGER.debug(f"Cache keys for {self._entry_id}: {list(reversal_cache.keys())}")
+            # Handle both old and new cache formats during migration
+            if 'checkpoints' in reversal_cache:
+                # New checkpoint format
+                last_state = reversal_cache.get('last_known_state', {})
+                checkpoint_data = {
+                    'last_known_state': {
+                        'time': last_state.get('time').isoformat() if last_state.get('time') else 'unknown',
+                        'direction': last_state.get('direction', 0),
+                        'azimuth': last_state.get('azimuth', 0)
+                    },
+                    'checkpoints': [
+                        {
+                            'time': cp['time'].isoformat(),
+                            'azimuth': cp['azimuth'],
+                            'direction': cp['direction'],
+                            'is_reversal': cp['is_reversal']
+                        }
+                        for cp in reversal_cache.get('checkpoints', [])
+                    ],
+                    'cache_source': 'checkpoint_system'
+                }
+            elif 'reversals' in reversal_cache:
+                # Old format (during migration)
+                last_state = reversal_cache.get('last_known_state', {})
+                checkpoint_data = {
+                    'last_known_state': {
+                        'time': last_state.get('time').isoformat() if last_state.get('time') else 'unknown',
+                        'direction': last_state.get('direction', 0)
+                    },
+                    'reversals': [
+                        {
+                            'time': r['time'].isoformat(),
+                            'azimuth': r['azimuth']
+                        }
+                        for r in reversal_cache.get('reversals', [])
+                    ],
+                    'cache_source': 'old_format_migrating'
+                }
+            else:
+                _LOGGER.warning(f"Cache has unexpected keys for {self._entry_id}: {list(reversal_cache.keys())}")
+                checkpoint_data = {
+                    'cache_source': 'invalid_format',
+                    'error': f'Cache missing expected keys. Has: {list(reversal_cache.keys())}'
+                }
         else:
-            reversal_data = {
+            _LOGGER.debug(f"No reversal cache loaded for {self._entry_id}")
+            checkpoint_data = {
                 'cache_source': 'not_available',
-                'error': 'Reversal cache not loaded'
+                'error': 'Checkpoint cache not loaded'
             }
         
         # Store all moon position data as attributes, including next target and update time
@@ -467,15 +510,15 @@ class AzimuthSensor(BaseAzimuthSensor):
                 attributes['reversal'] = is_reversal
                 attributes['reversal_time'] = reversal_time
                 attributes['search_performance'] = search_metrics
-                attributes['reversal_cache'] = reversal_data
+                attributes['checkpoint_cache'] = checkpoint_data
                 attributes['calculated_direction'] = calculated_direction
             
             self._attr_extra_state_attributes = attributes
         except Exception as e:
             # Minimal attributes if even this fails
             self._attr_extra_state_attributes = {
-                'error': f'Attribute error: {e}',
-                'reversal_cache': reversal_data
+                'next_update': next_update_time,
+                'error': f'Attribute error: {e}'
             }
         
         # Ensure we always return a datetime, not None

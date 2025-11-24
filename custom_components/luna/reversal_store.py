@@ -50,14 +50,22 @@ class ReversalStore:
                 if time_str:
                     data['last_known_state']['time'] = datetime.datetime.fromisoformat(time_str)
             
+            # Handle old format (reversals)
             if 'reversals' in data:
                 for reversal in data['reversals']:
                     if 'time' in reversal and isinstance(reversal['time'], str):
                         reversal['time'] = datetime.datetime.fromisoformat(reversal['time'])
             
+            # Handle new format (checkpoints)
+            if 'checkpoints' in data:
+                for checkpoint in data['checkpoints']:
+                    if 'time' in checkpoint and isinstance(checkpoint['time'], str):
+                        checkpoint['time'] = datetime.datetime.fromisoformat(checkpoint['time'])
+            
+            checkpoint_count = len(data.get('checkpoints', [])) if 'checkpoints' in data else len(data.get('reversals', []))
             _LOGGER.debug(
-                f"Loaded reversal cache for entry {self.entry_id}: "
-                f"{len(data.get('reversals', []))} reversals"
+                f"Loaded cache for entry {self.entry_id}: "
+                f"{checkpoint_count} checkpoints/reversals"
             )
             
             return data
@@ -78,11 +86,16 @@ class ReversalStore:
             save_data = {}
             
             if 'last_known_state' in data:
+                last_state = data['last_known_state']
                 save_data['last_known_state'] = {
-                    'time': data['last_known_state']['time'].isoformat(),
-                    'direction': data['last_known_state']['direction']
+                    'time': last_state['time'].isoformat(),
+                    'direction': last_state['direction']
                 }
+                # Include azimuth if present (new format)
+                if 'azimuth' in last_state:
+                    save_data['last_known_state']['azimuth'] = last_state['azimuth']
             
+            # Handle old format (reversals)
             if 'reversals' in data:
                 save_data['reversals'] = []
                 for reversal in data['reversals']:
@@ -91,14 +104,26 @@ class ReversalStore:
                         'azimuth': reversal['azimuth']
                     })
             
+            # Handle new format (checkpoints)
+            if 'checkpoints' in data:
+                save_data['checkpoints'] = []
+                for checkpoint in data['checkpoints']:
+                    save_data['checkpoints'].append({
+                        'time': checkpoint['time'].isoformat(),
+                        'azimuth': checkpoint['azimuth'],
+                        'direction': checkpoint['direction'],
+                        'is_reversal': checkpoint['is_reversal']
+                    })
+            
             if 'location' in data:
                 save_data['location'] = data['location']
             
             await self._store.async_save(save_data)
             
+            checkpoint_count = len(save_data.get('checkpoints', [])) if 'checkpoints' in save_data else len(save_data.get('reversals', []))
             _LOGGER.debug(
-                f"Saved reversal cache for entry {self.entry_id}: "
-                f"{len(save_data.get('reversals', []))} reversals"
+                f"Saved cache for entry {self.entry_id}: "
+                f"{checkpoint_count} checkpoints/reversals"
             )
             
         except Exception as e:
@@ -151,4 +176,3 @@ async def remove_reversal_cache(hass: HomeAssistant, entry_id: str) -> None:
     """
     store = ReversalStore(hass, entry_id)
     await store.async_remove()
-

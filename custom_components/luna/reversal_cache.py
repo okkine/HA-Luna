@@ -1,4 +1,4 @@
-"""Azimuth reversal cache manager."""
+"""Azimuth checkpoint cache manager (reversals + lunar transit checkpoints)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     AZIMUTH_REVERSAL_CACHE_LENGTH,
-    AZIMUTH_REVERSAL_MAX_SEARCH_DAYS,
     AZIMUTH_REVERSAL_SEARCH_MAX_ITERATIONS,
     AZIMUTH_DEGREE_TOLERANCE,
     TROPICAL_LATITUDE_THRESHOLD,
@@ -29,19 +28,17 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class ReversalCacheManager:
-    """Manages azimuth reversal cache with persistent storage."""
+    """Manages azimuth checkpoint cache (reversals + lunar transit) with persistent storage."""
     
     def __init__(self, hass: HomeAssistant):
-        """Initialize the reversal cache manager."""
+        """Initialize the checkpoint cache manager."""
         self.hass = hass
         self._maintenance_timers = {}  # Dict[entry_id, timer]
-        self._daily_check_timers = {}  # Dict[entry_id, timer]
-        self._weekly_check_timers = {}  # Dict[entry_id, timer]
         self._initialized_entries = set()
     
     async def initialize_entry(self, entry_id: str) -> None:
         """
-        Initialize reversal cache for an entry.
+        Initialize checkpoint cache for an entry.
         
         Args:
             entry_id: Config entry ID
@@ -54,48 +51,45 @@ class ReversalCacheManager:
             # Try to load existing cache
             cache = await load_reversal_cache(self.hass, entry_id)
             
+            # Check for old cache format and force reinitialization
+            if cache and 'reversals' in cache and 'checkpoints' not in cache:
+                _LOGGER.info(f"Migrating old cache format to checkpoint system for {entry_id}")
+                cache = None
+            
             if cache is None:
                 # No cache exists, initialize from scratch
-                _LOGGER.info(f"Initializing new reversal cache for entry {entry_id}")
+                _LOGGER.info(f"Initializing new checkpoint cache for entry {entry_id}")
                 cache = await self._initialize_from_lunar_transit(entry_id)
             else:
                 # Cache exists, validate and clean up
-                _LOGGER.info(f"Loaded existing reversal cache for entry {entry_id}")
+                _LOGGER.info(f"Loaded existing checkpoint cache for entry {entry_id}")
                 cache = await self._validate_and_cleanup_cache(entry_id, cache)
             
-            # Schedule maintenance and checks
+            # Schedule maintenance
             await self._schedule_next_maintenance(entry_id)
-            await self._schedule_recalculation_check(entry_id)
             
             self._initialized_entries.add(entry_id)
             
+            reversal_count = sum(1 for cp in cache['checkpoints'] if cp['is_reversal'])
             _LOGGER.info(
-                f"Reversal cache initialized for {entry_id}: "
-                f"{len(cache['reversals'])} future reversals"
+                f"Checkpoint cache initialized for {entry_id}: "
+                f"{len(cache['checkpoints'])} checkpoints ({reversal_count} reversals)"
             )
             
         except Exception as e:
-            _LOGGER.error(f"Error initializing reversal cache for entry {entry_id}: {e}", exc_info=True)
+            _LOGGER.error(f"Error initializing checkpoint cache for entry {entry_id}: {e}", exc_info=True)
     
     async def remove_entry(self, entry_id: str) -> None:
         """
-        Remove reversal cache for an entry.
+        Remove checkpoint cache for an entry.
         
         Args:
             entry_id: Config entry ID
         """
-        # Cancel timers
+        # Cancel maintenance timer
         if entry_id in self._maintenance_timers:
             self._maintenance_timers[entry_id].cancel()
             del self._maintenance_timers[entry_id]
-        
-        if entry_id in self._daily_check_timers:
-            self._daily_check_timers[entry_id].cancel()
-            del self._daily_check_timers[entry_id]
-        
-        if entry_id in self._weekly_check_timers:
-            self._weekly_check_timers[entry_id].cancel()
-            del self._weekly_check_timers[entry_id]
         
         # Remove from initialized set
         self._initialized_entries.discard(entry_id)
@@ -103,18 +97,18 @@ class ReversalCacheManager:
         # Remove persistent storage
         await remove_reversal_cache(self.hass, entry_id)
         
-        _LOGGER.info(f"Removed reversal cache for entry {entry_id}")
+        _LOGGER.info(f"Removed checkpoint cache for entry {entry_id}")
     
     async def get_reversals(self, entry_id: str, current_time: Optional[datetime.datetime] = None) -> Dict[str, Any]:
         """
-        Get reversal cache for an entry.
+        Get checkpoint cache for an entry.
         
         Args:
             entry_id: Config entry ID
             current_time: Current time (defaults to now)
             
         Returns:
-            Cache dictionary with last_known_state and reversals
+            Cache dictionary with last_known_state and checkpoints
         """
         if current_time is None:
             current_time = dt_util.now()
@@ -147,10 +141,17 @@ class ReversalCacheManager:
         direction = cache['last_known_state']['direction']
         last_known_time = cache['last_known_state']['time']
         
-        # Count reversals between last_known_time and current_time
-        for reversal in cache['reversals']:
-            if last_known_time < reversal['time'] <= current_time:
-                direction *= -1
+        # Handle both old and new cache formats during migration
+        if 'checkpoints' in cache:
+            # New checkpoint format - only flip direction for actual reversals
+            for checkpoint in cache['checkpoints']:
+                if last_known_time < checkpoint['time'] <= current_time and checkpoint.get('is_reversal', False):
+                    direction *= -1
+        elif 'reversals' in cache:
+            # Old format - all entries are reversals
+            for reversal in cache['reversals']:
+                if last_known_time < reversal['time'] <= current_time:
+                    direction *= -1
         
         return direction
     
@@ -187,53 +188,68 @@ class ReversalCacheManager:
         
         az_before = get_moon_position(self.hass, transit_minus_10, entry_id, config_data=config_data)['azimuth']
         az_after = get_moon_position(self.hass, transit_plus_10, entry_id, config_data=config_data)['azimuth']
+        transit_azimuth = get_moon_position(self.hass, prev_lunar_transit_dt, entry_id, config_data=config_data)['azimuth']
         
         derivative = calculate_azimuth_derivative(az_before, az_after)
         direction_at_transit = 1 if derivative > 0 else -1
         
         _LOGGER.debug(f"Direction at lunar transit: {direction_at_transit}")
         
-        # Scan from previous transit forward
-        search_end = now_utc + timedelta(days=AZIMUTH_REVERSAL_MAX_SEARCH_DAYS)
-        all_reversals = await self._scan_for_reversals(
+        # Scan from previous transit forward for checkpoints
+        # Use 30-day max search window as safety limit
+        search_end = now_utc + timedelta(days=30)
+        all_checkpoints = await self._scan_for_checkpoints(
             entry_id,
             start_time=prev_lunar_transit_dt,
             end_time=search_end,
             start_direction=direction_at_transit,
-            config_data=config_data
+            config_data=config_data,
+            target_count=AZIMUTH_REVERSAL_CACHE_LENGTH
         )
         
         # Split into passed and future
-        passed = [r for r in all_reversals if r['time'] <= now_utc]
-        future = [r for r in all_reversals if r['time'] > now_utc]
+        passed = [cp for cp in all_checkpoints if cp['time'] <= now_utc]
+        future = [cp for cp in all_checkpoints if cp['time'] > now_utc]
         
-        _LOGGER.debug(f"Found {len(passed)} passed and {len(future)} future reversals")
+        reversal_count = sum(1 for cp in all_checkpoints if cp['is_reversal'])
+        _LOGGER.debug(f"Found {len(passed)} passed and {len(future)} future checkpoints ({reversal_count} reversals)")
         
-        # Calculate current direction
+        # Calculate current direction (only flip for reversals)
         current_direction = direction_at_transit
-        for _ in passed:
-            current_direction *= -1
+        for cp in passed:
+            if cp['is_reversal']:
+                current_direction *= -1
         
         # Set last_known_state
         if passed:
-            last_known_time = passed[-1]['time']
-            last_known_direction = current_direction
+            last_checkpoint = passed[-1]
+            last_known_time = last_checkpoint['time']
+            last_known_azimuth = last_checkpoint['azimuth']
+            last_known_direction = last_checkpoint['direction']
         else:
             last_known_time = prev_lunar_transit_dt
+            last_known_azimuth = transit_azimuth
             last_known_direction = direction_at_transit
         
-        # Keep up to AZIMUTH_REVERSAL_CACHE_LENGTH future reversals
+        # Store all future checkpoints
         cache = {
             'last_known_state': {
                 'time': last_known_time,
-                'direction': last_known_direction
+                'direction': last_known_direction,
+                'azimuth': last_known_azimuth
             },
-            'reversals': future[:AZIMUTH_REVERSAL_CACHE_LENGTH],
+            'checkpoints': future,
             'location': {
                 'latitude': config_data.get('latitude', self.hass.config.latitude),
                 'longitude': config_data.get('longitude', self.hass.config.longitude)
             }
         }
+        
+        _LOGGER.info(
+            f"Initialized cache for {entry_id}: "
+            f"{len(cache['checkpoints'])} checkpoints, "
+            f"last_known_state at {last_known_time.isoformat()}"
+        )
         
         await save_reversal_cache(self.hass, entry_id, cache)
         
@@ -257,6 +273,11 @@ class ReversalCacheManager:
         config_data = get_config_entry_data(entry_id)
         now_utc = dt_util.now().astimezone(timezone.utc)
         
+        # Check for invalid cache structure - reinitialize if needed
+        if 'checkpoints' not in cache or 'last_known_state' not in cache:
+            _LOGGER.warning(f"Invalid cache structure for {entry_id}, reinitializing")
+            return await self._initialize_from_lunar_transit(entry_id)
+        
         # Check if location changed
         cached_lat = cache.get('location', {}).get('latitude')
         cached_lon = cache.get('location', {}).get('longitude')
@@ -267,42 +288,38 @@ class ReversalCacheManager:
             _LOGGER.info(f"Location changed for {entry_id}, reinitializing cache")
             return await self._initialize_from_lunar_transit(entry_id)
         
-        # Remove past reversals and update last_known_state
-        passed_reversals = [r for r in cache['reversals'] if r['time'] <= now_utc]
+        # Remove past checkpoints and update last_known_state
+        passed_checkpoints = [cp for cp in cache['checkpoints'] if cp['time'] <= now_utc]
         
-        if passed_reversals:
-            _LOGGER.debug(f"Removing {len(passed_reversals)} passed reversals")
+        if passed_checkpoints:
+            _LOGGER.debug(f"Removing {len(passed_checkpoints)} passed checkpoints")
             
-            # Update last_known_state
-            direction = cache['last_known_state']['direction']
-            for _ in passed_reversals:
-                direction *= -1
-            
+            # Update last_known_state from last passed checkpoint
+            last_checkpoint = passed_checkpoints[-1]
             cache['last_known_state'] = {
-                'time': passed_reversals[-1]['time'],
-                'direction': direction
+                'time': last_checkpoint['time'],
+                'direction': last_checkpoint['direction'],
+                'azimuth': last_checkpoint['azimuth']
             }
             
-            # Remove passed reversals
-            cache['reversals'] = [r for r in cache['reversals'] if r['time'] > now_utc]
+            # Remove passed checkpoints
+            cache['checkpoints'] = [cp for cp in cache['checkpoints'] if cp['time'] > now_utc]
         
-        # Ensure we have enough future reversals
-        if len(cache['reversals']) < AZIMUTH_REVERSAL_CACHE_LENGTH:
-            _LOGGER.debug(f"Need more reversals, calculating...")
-            cache = await self._refill_reversals(entry_id, cache, config_data)
+        # Ensure we have checkpoints covering the search window
+        cache = await self._refill_checkpoints(entry_id, cache, config_data)
         
         await save_reversal_cache(self.hass, entry_id, cache)
         
         return cache
     
-    async def _refill_reversals(
+    async def _refill_checkpoints(
         self,
         entry_id: str,
         cache: Dict[str, Any],
         config_data: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Calculate additional reversals to reach AZIMUTH_REVERSAL_CACHE_LENGTH.
+        Calculate additional checkpoints to maintain exactly AZIMUTH_REVERSAL_CACHE_LENGTH checkpoints.
         
         Args:
             entry_id: Config entry ID
@@ -312,99 +329,200 @@ class ReversalCacheManager:
         Returns:
             Updated cache
         """
+        # Only refill if we have fewer than the target number of checkpoints
+        if len(cache['checkpoints']) >= AZIMUTH_REVERSAL_CACHE_LENGTH:
+            return cache
+        
         # Determine starting point for new search
-        if cache['reversals']:
-            search_start = cache['reversals'][-1]['time']
-            start_direction = self.get_current_direction(cache, search_start)
+        if cache['checkpoints']:
+            search_start = cache['checkpoints'][-1]['time']
+            start_direction = cache['checkpoints'][-1]['direction']
         else:
             search_start = cache['last_known_state']['time']
             start_direction = cache['last_known_state']['direction']
         
-        search_end = search_start + timedelta(days=AZIMUTH_REVERSAL_MAX_SEARCH_DAYS)
+        # Search forward until we have enough checkpoints
+        # Maximum search window to prevent infinite loops (30 days)
+        now_utc = dt_util.now().astimezone(timezone.utc)
+        search_end = now_utc + timedelta(days=30)
         
-        # Scan for more reversals
-        new_reversals = await self._scan_for_reversals(
+        new_checkpoints = await self._scan_for_checkpoints(
             entry_id,
             start_time=search_start,
             end_time=search_end,
             start_direction=start_direction,
-            config_data=config_data
+            config_data=config_data,
+            target_count=AZIMUTH_REVERSAL_CACHE_LENGTH - len(cache['checkpoints'])
         )
         
-        # Add new reversals to cache
-        cache['reversals'].extend(new_reversals)
-        cache['reversals'] = cache['reversals'][:AZIMUTH_REVERSAL_CACHE_LENGTH]
+        # Add new checkpoints to cache (keep all, sorted chronologically)
+        cache['checkpoints'].extend(new_checkpoints)
+        cache['checkpoints'].sort(key=lambda cp: cp['time'])
         
         return cache
     
-    async def _scan_for_reversals(
+    async def _scan_for_checkpoints(
         self,
         entry_id: str,
         start_time: datetime.datetime,
         end_time: datetime.datetime,
         start_direction: int,
-        config_data: Dict[str, Any]
+        config_data: Dict[str, Any],
+        target_count: int = None
     ) -> List[Dict[str, Any]]:
         """
-        Scan for azimuth reversals in time window.
+        Scan for azimuth checkpoints (reversals + lunar transits) until target count reached.
+        
+        Finds whichever comes first chronologically: reversal or lunar transit.
         
         Args:
             entry_id: Config entry ID
             start_time: Start of scan window
-            end_time: End of scan window
+            end_time: End of scan window (safety limit)
             start_direction: Known direction at start_time
+            config_data: Config data
+            target_count: Stop after finding this many checkpoints (None = no limit)
+            
+        Returns:
+            List of checkpoint dictionaries (chronologically sorted)
+        """
+        checkpoints = []
+        current_direction = start_direction
+        search_time = start_time
+        
+        while search_time < end_time:
+            # Check if we've reached target count
+            if target_count is not None and len(checkpoints) >= target_count:
+                break
+            
+            # Find next lunar transit after search_time
+            next_lunar_transit = await self._calculate_lunar_transit(
+                search_time + timedelta(minutes=1),
+                entry_id,
+                config_data
+            )
+            
+            # Find next reversal by scanning forward
+            next_reversal_time = None
+            next_reversal_azimuth = None
+            scan_time = search_time + timedelta(minutes=5)
+            
+            # Scan up to next lunar transit (or end_time if no lunar transit)
+            scan_limit = min(next_lunar_transit if next_lunar_transit else end_time, end_time)
+            
+            while scan_time < scan_limit:
+                # Sample azimuth change over 10-minute window
+                az_before = get_moon_position(self.hass, scan_time, entry_id, config_data=config_data)['azimuth']
+                az_after = get_moon_position(
+                    self.hass,
+                    scan_time + timedelta(minutes=10),
+                    entry_id,
+                    config_data=config_data
+                )['azimuth']
+                
+                derivative = calculate_azimuth_derivative(az_before, az_after)
+                observed_direction = 1 if derivative > 0 else -1
+                
+                # Check for direction change (reversal)
+                if observed_direction != current_direction:
+                    try:
+                        # Binary search to find exact reversal
+                        reversal_time, reversal_azimuth = await self._binary_search_reversal(
+                            scan_time - timedelta(minutes=5),
+                            scan_time + timedelta(minutes=10),
+                            entry_id,
+                            config_data
+                        )
+                        
+                        next_reversal_time = reversal_time
+                        next_reversal_azimuth = reversal_azimuth
+                        break  # Found reversal, stop scanning
+                        
+                    except Exception as e:
+                        _LOGGER.warning(f"Error finding reversal: {e}")
+                
+                # Advance scan window
+                scan_time += timedelta(minutes=30)
+            
+            # Determine which comes first: reversal or lunar transit
+            if next_reversal_time and (not next_lunar_transit or next_reversal_time < next_lunar_transit):
+                # Reversal comes first
+                current_direction *= -1  # Flip direction
+                
+                checkpoints.append({
+                    'time': next_reversal_time,
+                    'azimuth': next_reversal_azimuth,
+                    'direction': current_direction,
+                    'is_reversal': True
+                })
+                
+                search_time = next_reversal_time
+                
+            elif next_lunar_transit:
+                # Lunar transit comes first (or no reversal found)
+                lunar_transit_azimuth = get_moon_position(
+                    self.hass, 
+                    next_lunar_transit, 
+                    entry_id, 
+                    config_data=config_data
+                )['azimuth']
+                
+                checkpoints.append({
+                    'time': next_lunar_transit,
+                    'azimuth': lunar_transit_azimuth,
+                    'direction': current_direction,  # Direction doesn't change
+                    'is_reversal': False
+                })
+                
+                search_time = next_lunar_transit
+                
+            else:
+                # No reversal or lunar transit found - shouldn't happen, but safety break
+                _LOGGER.warning(f"No checkpoint found between {search_time} and {end_time}")
+                break
+        
+        # Sort chronologically
+        checkpoints.sort(key=lambda cp: cp['time'])
+        
+        reversal_count = sum(1 for cp in checkpoints if cp['is_reversal'])
+        _LOGGER.debug(
+            f"Found {len(checkpoints)} checkpoints ({reversal_count} reversals, "
+            f"{len(checkpoints) - reversal_count} lunar transits) for entry {entry_id}"
+        )
+        
+        return checkpoints
+    
+    async def _calculate_lunar_transit(
+        self,
+        after_time: datetime.datetime,
+        entry_id: str,
+        config_data: Dict[str, Any]
+    ) -> Optional[datetime.datetime]:
+        """
+        Calculate next lunar transit after given time.
+        
+        Args:
+            after_time: Find lunar transit after this time
+            entry_id: Config entry ID
             config_data: Config data
             
         Returns:
-            List of reversal dictionaries
+            Next lunar transit datetime (UTC), or None if error
         """
-        reversals = []
-        current_direction = start_direction
-        search_time = start_time + timedelta(minutes=5)
-        
-        while search_time < end_time:
-            # Sample azimuth change over 10-minute window
-            az_before = get_moon_position(self.hass, search_time, entry_id, config_data=config_data)['azimuth']
-            az_after = get_moon_position(
-                self.hass,
-                search_time + timedelta(minutes=10),
-                entry_id,
-                config_data=config_data
-            )['azimuth']
+        try:
+            observer = ephem.Observer()
+            observer.lat = str(config_data.get('latitude', self.hass.config.latitude))
+            observer.lon = str(config_data.get('longitude', self.hass.config.longitude))
+            observer.elevation = config_data.get('elevation', self.hass.config.elevation)
+            observer.date = after_time
             
-            derivative = calculate_azimuth_derivative(az_before, az_after)
-            observed_direction = 1 if derivative > 0 else -1
+            moon = ephem.Moon()
+            next_transit = observer.next_transit(moon)
+            return next_transit.datetime().replace(tzinfo=timezone.utc)
             
-            # Check for direction change
-            if observed_direction != current_direction:
-                # Binary search to find exact reversal
-                try:
-                    reversal_time, reversal_azimuth = await self._binary_search_reversal(
-                        search_time - timedelta(minutes=5),
-                        search_time + timedelta(minutes=10),
-                        entry_id,
-                        config_data
-                    )
-                    
-                    reversals.append({
-                        'time': reversal_time,
-                        'azimuth': reversal_azimuth
-                    })
-                    
-                    current_direction *= -1
-                    
-                except Exception as e:
-                    _LOGGER.warning(f"Error finding reversal: {e}")
-            
-            search_time += timedelta(minutes=5)
-        
-        if len(reversals) < AZIMUTH_REVERSAL_CACHE_LENGTH:
-            _LOGGER.info(
-                f"Only found {len(reversals)} reversals within "
-                f"{AZIMUTH_REVERSAL_MAX_SEARCH_DAYS} days for entry {entry_id}"
-            )
-        
-        return reversals
+        except Exception as e:
+            _LOGGER.warning(f"Error calculating lunar transit: {e}")
+            return None
     
     async def _binary_search_reversal(
         self,
@@ -472,7 +590,7 @@ class ReversalCacheManager:
         return final_time, final_azimuth
     
     async def _schedule_next_maintenance(self, entry_id: str) -> None:
-        """Schedule maintenance for after next reversal."""
+        """Schedule maintenance for after next checkpoint."""
         # Cancel existing timer
         if entry_id in self._maintenance_timers:
             self._maintenance_timers[entry_id].cancel()
@@ -480,10 +598,10 @@ class ReversalCacheManager:
         try:
             cache = await load_reversal_cache(self.hass, entry_id)
             
-            if cache and cache['reversals']:
-                # Schedule for 100ms after first reversal
-                next_reversal_time = cache['reversals'][0]['time']
-                maintenance_time = next_reversal_time + timedelta(milliseconds=100)
+            if cache and cache.get('checkpoints'):
+                # Schedule for 100ms after first checkpoint
+                next_checkpoint_time = cache['checkpoints'][0]['time']
+                maintenance_time = next_checkpoint_time + timedelta(milliseconds=100)
                 
                 now = dt_util.now().astimezone(timezone.utc)
                 delay = (maintenance_time - now).total_seconds()
@@ -500,11 +618,13 @@ class ReversalCacheManager:
                         f"at {maintenance_time}"
                     )
                 else:
-                    # Reversal already passed, run maintenance immediately
+                    # Checkpoint already passed, run maintenance immediately
                     await self._perform_maintenance(entry_id)
+            else:
+                _LOGGER.debug(f"No checkpoints in cache for {entry_id}, skipping maintenance scheduling")
         
         except Exception as e:
-            _LOGGER.error(f"Error scheduling maintenance for {entry_id}: {e}")
+            _LOGGER.error(f"Error scheduling maintenance for {entry_id}: {e}", exc_info=True)
     
     async def _perform_maintenance(self, entry_id: str) -> None:
         """Perform scheduled maintenance."""
@@ -519,128 +639,33 @@ class ReversalCacheManager:
             config_data = get_config_entry_data(entry_id)
             now_utc = dt_util.now().astimezone(timezone.utc)
             
-            # Check if any reversals have passed
-            passed_reversals = [r for r in cache['reversals'] if r['time'] <= now_utc]
+            # Check if any checkpoints have passed
+            passed_checkpoints = [cp for cp in cache['checkpoints'] if cp['time'] <= now_utc]
             
-            if passed_reversals:
-                _LOGGER.debug(f"Updating last_known_state after {len(passed_reversals)} passed reversals")
+            if passed_checkpoints:
+                _LOGGER.debug(f"Updating last_known_state after {len(passed_checkpoints)} passed checkpoints")
                 
-                # Update last_known_state
-                direction = cache['last_known_state']['direction']
-                for _ in passed_reversals:
-                    direction *= -1
-                
+                # Update last_known_state from last passed checkpoint
+                last_checkpoint = passed_checkpoints[-1]
                 cache['last_known_state'] = {
-                    'time': passed_reversals[-1]['time'],
-                    'direction': direction
+                    'time': last_checkpoint['time'],
+                    'direction': last_checkpoint['direction'],
+                    'azimuth': last_checkpoint['azimuth']
                 }
                 
-                # Remove passed reversals
-                cache['reversals'] = [r for r in cache['reversals'] if r['time'] > now_utc]
+                # Remove passed checkpoints
+                cache['checkpoints'] = [cp for cp in cache['checkpoints'] if cp['time'] > now_utc]
             
-            # Ensure we have enough future reversals
-            if len(cache['reversals']) < AZIMUTH_REVERSAL_CACHE_LENGTH:
-                cache = await self._refill_reversals(entry_id, cache, config_data)
+            # Refill checkpoints to maintain coverage
+            cache = await self._refill_checkpoints(entry_id, cache, config_data)
             
             await save_reversal_cache(self.hass, entry_id, cache)
             
-            # Reschedule for next reversal
+            # Reschedule for next checkpoint
             await self._schedule_next_maintenance(entry_id)
             
         except Exception as e:
             _LOGGER.error(f"Error during maintenance for {entry_id}: {e}", exc_info=True)
-    
-    async def _schedule_recalculation_check(self, entry_id: str) -> None:
-        """Schedule daily (tropical) or weekly (non-tropical) recalculation check."""
-        config_data = get_config_entry_data(entry_id)
-        latitude = config_data.get('latitude', self.hass.config.latitude)
-        
-        if self._is_tropical_location(latitude):
-            await self._schedule_daily_check(entry_id)
-        else:
-            await self._schedule_weekly_check(entry_id)
-    
-    def _is_tropical_location(self, latitude: float) -> bool:
-        """Check if location is within tropics."""
-        return abs(latitude) <= TROPICAL_LATITUDE_THRESHOLD
-    
-    async def _schedule_daily_check(self, entry_id: str) -> None:
-        """Schedule daily midnight check for tropical locations."""
-        # Cancel existing timer
-        if entry_id in self._daily_check_timers:
-            self._daily_check_timers[entry_id].cancel()
-        
-        local_tz = zoneinfo.ZoneInfo(self.hass.config.time_zone)
-        now = dt_util.now(local_tz)
-        
-        # Next midnight
-        tomorrow_midnight = datetime.datetime.combine(
-            now.date() + timedelta(days=1),
-            datetime.time(0, 0, 0),
-            tzinfo=local_tz
-        )
-        
-        delay = (tomorrow_midnight - now).total_seconds()
-        
-        self._daily_check_timers[entry_id] = self.hass.loop.call_later(
-            delay,
-            lambda: self.hass.async_create_task(
-                self._perform_daily_check(entry_id)
-            )
-        )
-        
-        _LOGGER.debug(f"Scheduled daily check for {entry_id} in {delay/3600:.1f} hours")
-    
-    async def _perform_daily_check(self, entry_id: str) -> None:
-        """Perform daily check for tropical location."""
-        try:
-            _LOGGER.debug(f"Performing daily check for {entry_id}")
-            
-            # Just ensure cache is still valid and has enough reversals
-            cache = await load_reversal_cache(self.hass, entry_id)
-            if cache:
-                config_data = get_config_entry_data(entry_id)
-                cache = await self._validate_and_cleanup_cache(entry_id, cache)
-            
-            # Reschedule for tomorrow
-            await self._schedule_daily_check(entry_id)
-            
-        except Exception as e:
-            _LOGGER.error(f"Error during daily check for {entry_id}: {e}")
-    
-    async def _schedule_weekly_check(self, entry_id: str) -> None:
-        """Schedule weekly validation for non-tropical locations."""
-        # Cancel existing timer
-        if entry_id in self._weekly_check_timers:
-            self._weekly_check_timers[entry_id].cancel()
-        
-        delay = 7 * 24 * 3600  # 7 days in seconds
-        
-        self._weekly_check_timers[entry_id] = self.hass.loop.call_later(
-            delay,
-            lambda: self.hass.async_create_task(
-                self._perform_weekly_check(entry_id)
-            )
-        )
-        
-        _LOGGER.debug(f"Scheduled weekly check for {entry_id} in 7 days")
-    
-    async def _perform_weekly_check(self, entry_id: str) -> None:
-        """Perform weekly check for non-tropical location."""
-        try:
-            _LOGGER.debug(f"Performing weekly check for {entry_id}")
-            
-            # Validate cache
-            cache = await load_reversal_cache(self.hass, entry_id)
-            if cache:
-                config_data = get_config_entry_data(entry_id)
-                cache = await self._validate_and_cleanup_cache(entry_id, cache)
-            
-            # Reschedule for next week
-            await self._schedule_weekly_check(entry_id)
-            
-        except Exception as e:
-            _LOGGER.error(f"Error during weekly check for {entry_id}: {e}")
 
 
 # Global cache manager instance
@@ -653,4 +678,3 @@ def get_reversal_cache_manager(hass: HomeAssistant) -> ReversalCacheManager:
     if _cache_manager_instance is None:
         _cache_manager_instance = ReversalCacheManager(hass)
     return _cache_manager_instance
-

@@ -1,11 +1,12 @@
 """Constants for the Luna integration."""
 
 DOMAIN = "luna"
+NAME = "Luna"
 
 elevation_step = 0.5
 azimuth_step = 1
 
-DEBUG_ATTRIBUTES = False
+DEBUG_ATTRIBUTES = True
 # Debug flags for sensors
 DEBUG_ELEVATION_SENSOR = False
 DEBUG_AZIMUTH_SENSOR = False
@@ -18,9 +19,13 @@ AZIMUTH_DEGREE_TOLERANCE = 0.001 # degrees - azimuth precision tolerance
 
 # Azimuth reversal detection
 AZIMUTH_REVERSAL_SEARCH_MAX_ITERATIONS = 5000
-AZIMUTH_REVERSAL_CACHE_LENGTH = 4  # Number of future reversals to maintain
-AZIMUTH_REVERSAL_MAX_SEARCH_DAYS = 2  # Maximum days to search forward for reversals
-TROPICAL_LATITUDE_THRESHOLD = 23.5  # Latitude threshold for tropical locations
 
 # Azimuth ternary search iteration limit
 AZIMUTH_TERNARY_SEARCH_MAX_ITERATIONS = 5000  # Maximum iterations for binary search refinement
+
+# Azimuth checkpoint cache configuration
+AZIMUTH_REVERSAL_CACHE_LENGTH = 4  # Number of checkpoints to cache (reversals + lunar transits)
+
+# Tropical latitude threshold (reversals only occur within ±23.44° of equator)
+# Using 23.45° to account for potential ephem calculation tolerances
+TROPICAL_LATITUDE_THRESHOLD = 28.73  # degrees
