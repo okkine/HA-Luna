@@ -48,6 +48,20 @@ class ReversalCacheManager:
             return
         
         try:
+            # Check latitude to determine if we're in tropical region
+            config_data = get_config_entry_data(entry_id)
+            latitude = abs(config_data.get('latitude', self.hass.config.latitude))
+            
+            if latitude > TROPICAL_LATITUDE_THRESHOLD:
+                # Non-tropical latitude - no reversals possible
+                # Just initialize last_known_state with direction, no checkpoints needed
+                _LOGGER.info(f"Non-tropical latitude ({latitude:.2f}°) for {entry_id}, skipping checkpoint cache")
+                cache = await self._initialize_non_tropical(entry_id)
+                self._initialized_entries.add(entry_id)
+                _LOGGER.info(f"Non-tropical cache initialized for {entry_id}: direction={cache['last_known_state']['direction']}")
+                return
+            
+            # Tropical latitude - full checkpoint system
             # Try to load existing cache
             cache = await load_reversal_cache(self.hass, entry_id)
             
@@ -123,7 +137,15 @@ class ReversalCacheManager:
         if cache is None:
             # Something went wrong, reinitialize
             _LOGGER.warning(f"Cache missing for initialized entry {entry_id}, reinitializing")
-            cache = await self._initialize_from_lunar_transit(entry_id)
+            
+            # Check latitude to determine initialization method
+            config_data = get_config_entry_data(entry_id)
+            latitude = abs(config_data.get('latitude', self.hass.config.latitude))
+            
+            if latitude > TROPICAL_LATITUDE_THRESHOLD:
+                cache = await self._initialize_non_tropical(entry_id)
+            else:
+                cache = await self._initialize_from_lunar_transit(entry_id)
         
         return cache
     
@@ -154,6 +176,65 @@ class ReversalCacheManager:
                     direction *= -1
         
         return direction
+    
+    async def _initialize_non_tropical(self, entry_id: str) -> Dict[str, Any]:
+        """
+        Initialize cache for non-tropical latitude (no reversals possible).
+        
+        Sets last_known_state with azimuth direction that never changes.
+        Direction is sampled at previous lunar transit for consistency.
+        No checkpoints needed.
+        
+        Args:
+            entry_id: Config entry ID
+            
+        Returns:
+            Minimal cache dictionary with only last_known_state
+        """
+        config_data = get_config_entry_data(entry_id)
+        now = dt_util.now()
+        now_utc = now.astimezone(timezone.utc)
+        
+        # Get previous lunar transit for stable direction sampling
+        observer = ephem.Observer()
+        observer.lat = str(config_data.get('latitude', self.hass.config.latitude))
+        observer.lon = str(config_data.get('longitude', self.hass.config.longitude))
+        observer.elevation = config_data.get('elevation', self.hass.config.elevation)
+        observer.date = now_utc
+        
+        moon = ephem.Moon()
+        prev_lunar_transit = observer.previous_transit(moon)
+        prev_lunar_transit_dt = prev_lunar_transit.datetime().replace(tzinfo=timezone.utc)
+        
+        # Sample direction at previous lunar transit
+        transit_minus_10 = prev_lunar_transit_dt - timedelta(minutes=10)
+        transit_plus_10 = prev_lunar_transit_dt + timedelta(minutes=10)
+        
+        az_before = get_moon_position(self.hass, transit_minus_10, entry_id, config_data=config_data)['azimuth']
+        az_after = get_moon_position(self.hass, transit_plus_10, entry_id, config_data=config_data)['azimuth']
+        transit_azimuth = get_moon_position(self.hass, prev_lunar_transit_dt, entry_id, config_data=config_data)['azimuth']
+        
+        derivative = calculate_azimuth_derivative(az_before, az_after)
+        direction = 1 if derivative > 0 else -1
+        
+        # Create minimal cache with only last_known_state (no checkpoints)
+        cache = {
+            'last_known_state': {
+                'time': prev_lunar_transit_dt,
+                'direction': direction,
+                'azimuth': transit_azimuth
+            },
+            'checkpoints': [],  # Empty - no reversals at this latitude
+            'location': {
+                'latitude': config_data.get('latitude', self.hass.config.latitude),
+                'longitude': config_data.get('longitude', self.hass.config.longitude)
+            },
+            'non_tropical': True  # Flag to indicate this is a non-tropical cache
+        }
+        
+        await save_reversal_cache(self.hass, entry_id, cache)
+        
+        return cache
     
     async def _initialize_from_lunar_transit(self, entry_id: str) -> Dict[str, Any]:
         """
@@ -195,23 +276,49 @@ class ReversalCacheManager:
         
         _LOGGER.debug(f"Direction at lunar transit: {direction_at_transit}")
         
-        # Scan from previous transit forward for checkpoints
+        # Scan from previous transit forward, searching only for future checkpoints
         # Use 30-day max search window as safety limit
         search_end = now_utc + timedelta(days=30)
-        all_checkpoints = await self._scan_for_checkpoints(
-            entry_id,
-            start_time=prev_lunar_transit_dt,
-            end_time=search_end,
-            start_direction=direction_at_transit,
-            config_data=config_data,
-            target_count=AZIMUTH_REVERSAL_CACHE_LENGTH
-        )
         
-        # Split into passed and future
-        passed = [cp for cp in all_checkpoints if cp['time'] <= now_utc]
-        future = [cp for cp in all_checkpoints if cp['time'] > now_utc]
+        # Keep track of all checkpoints found (for last_known_state)
+        all_passed = []
+        all_future = []
+        current_search_start = prev_lunar_transit_dt
+        current_search_direction = direction_at_transit
         
-        reversal_count = sum(1 for cp in all_checkpoints if cp['is_reversal'])
+        # Keep searching until we have enough future checkpoints
+        while len(all_future) < AZIMUTH_REVERSAL_CACHE_LENGTH and current_search_start < search_end:
+            # Search for next checkpoint
+            checkpoints = await self._scan_for_checkpoints(
+                entry_id,
+                start_time=current_search_start,
+                end_time=search_end,
+                start_direction=current_search_direction,
+                config_data=config_data,
+                target_count=1  # Find one checkpoint at a time
+            )
+            
+            if not checkpoints:
+                # No more checkpoints found
+                _LOGGER.warning(f"Could not find enough future checkpoints, only found {len(all_future)}")
+                break
+            
+            checkpoint = checkpoints[0]
+            
+            # Check if this checkpoint is in the future
+            if checkpoint['time'] > now_utc:
+                all_future.append(checkpoint)
+            else:
+                all_passed.append(checkpoint)
+            
+            # Move search forward from this checkpoint
+            current_search_start = checkpoint['time']
+            current_search_direction = checkpoint['direction']
+        
+        passed = all_passed
+        future = all_future
+        
+        reversal_count = sum(1 for cp in passed + future if cp['is_reversal'])
         _LOGGER.debug(f"Found {len(passed)} passed and {len(future)} future checkpoints ({reversal_count} reversals)")
         
         # Calculate current direction (only flip for reversals)
@@ -276,7 +383,11 @@ class ReversalCacheManager:
         # Check for invalid cache structure - reinitialize if needed
         if 'checkpoints' not in cache or 'last_known_state' not in cache:
             _LOGGER.warning(f"Invalid cache structure for {entry_id}, reinitializing")
-            return await self._initialize_from_lunar_transit(entry_id)
+            latitude = abs(config_data.get('latitude', self.hass.config.latitude))
+            if latitude > TROPICAL_LATITUDE_THRESHOLD:
+                return await self._initialize_non_tropical(entry_id)
+            else:
+                return await self._initialize_from_lunar_transit(entry_id)
         
         # Check if location changed
         cached_lat = cache.get('location', {}).get('latitude')
@@ -286,7 +397,15 @@ class ReversalCacheManager:
         
         if cached_lat != current_lat or cached_lon != current_lon:
             _LOGGER.info(f"Location changed for {entry_id}, reinitializing cache")
-            return await self._initialize_from_lunar_transit(entry_id)
+            latitude = abs(current_lat)
+            if latitude > TROPICAL_LATITUDE_THRESHOLD:
+                return await self._initialize_non_tropical(entry_id)
+            else:
+                return await self._initialize_from_lunar_transit(entry_id)
+        
+        # If this is a non-tropical cache, just return it (no maintenance needed)
+        if cache.get('non_tropical', False):
+            return cache
         
         # Remove past checkpoints and update last_known_state
         passed_checkpoints = [cp for cp in cache['checkpoints'] if cp['time'] <= now_utc]
@@ -597,6 +716,11 @@ class ReversalCacheManager:
         
         try:
             cache = await load_reversal_cache(self.hass, entry_id)
+            
+            # Skip maintenance scheduling for non-tropical caches (no checkpoints to maintain)
+            if cache and cache.get('non_tropical', False):
+                _LOGGER.debug(f"Skipping maintenance scheduling for non-tropical entry {entry_id}")
+                return
             
             if cache and cache.get('checkpoints'):
                 # Schedule for 100ms after first checkpoint

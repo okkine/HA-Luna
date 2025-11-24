@@ -387,21 +387,6 @@ class AzimuthSensor(BaseAzimuthSensor):
                     if future_reversals:
                         reversal_time = future_reversals[0]['time']
 
-            # Calculate current direction for debugging
-            calculated_direction = 0
-            if reversal_cache:
-                try:
-                    from .reversal_cache import get_reversal_cache_manager
-                    cache_manager = get_reversal_cache_manager(self.hass)
-                    calculated_direction = cache_manager.get_current_direction(
-                        reversal_cache,
-                        now.astimezone(timezone.utc)
-                    )
-                except Exception as e:
-                    calculated_direction = f"Error: {e}"
-            else:
-                calculated_direction = "Cache not available"
-
             if is_reversal and next_reversal_time_if_target is not None:
                 next_update_time = next_reversal_time_if_target
                 search_metrics = {"info": "Next target is a reversal; using cached reversal time."}
@@ -511,7 +496,6 @@ class AzimuthSensor(BaseAzimuthSensor):
                 attributes['reversal_time'] = reversal_time
                 attributes['search_performance'] = search_metrics
                 attributes['checkpoint_cache'] = checkpoint_data
-                attributes['calculated_direction'] = calculated_direction
             
             self._attr_extra_state_attributes = attributes
         except Exception as e:
