@@ -1,7 +1,6 @@
 {
   "domain": "luna",
   "name": "Luna",
-  "version": "2025.11.25",
   "codeowners": [
     "@okkine"
   ],
@@ -14,5 +13,6 @@
   "quality_scale": "bronze",
   "requirements": ["python-slugify", "ephem>=4.1.4", "ambiance"],
   "ssdp": [],
+  "version": "2025.11.25",
   "zeroconf": []
 }
