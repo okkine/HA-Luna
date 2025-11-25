@@ -1,11 +1,8 @@
 {
   "name": "Luna",
   "render_readme": true,
-  "domains": ["sensor"],
   "homeassistant": "2023.8.0",
-  "iot_class": "local_polling",
   "content_in_root": false,
   "zip_release": false,
-  "filename": "custom_components/luna/manifest.json",
-  "domain": "luna"
+  "filename": "custom_components/luna/manifest.json"
 } 
