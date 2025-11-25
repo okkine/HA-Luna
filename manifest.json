@@ -5,7 +5,7 @@
   "requirements": ["python-slugify", "ephem>=4.1.4", "ambiance"],
   "dependencies": [],
   "codeowners": ["@okkine"],
-  "version": "25.11.18",
+  "version": "2025.11.25",
   "iot_class": "local_polling",
   "config_flow": true
 } 
