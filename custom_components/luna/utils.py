@@ -488,8 +488,23 @@ def get_next_step(
             from .reversal_cache import get_reversal_cache_manager
             cache_manager = get_reversal_cache_manager(hass)
             current_direction = cache_manager.get_current_direction(reversal_cache, dt_utc)
-            # Filter to future reversals only
-            reversals = [r for r in reversal_cache.get('reversals', []) if r['time'] > dt_utc]
+            
+            # Handle both old and new cache formats during migration
+            if 'checkpoints' in reversal_cache:
+                # New checkpoint format - get ALL future checkpoints (not just reversals)
+                all_checkpoints = [
+                    cp for cp in reversal_cache.get('checkpoints', []) 
+                    if cp['time'] > dt_utc
+                ]
+                # Keep separate list of just reversals for compatibility
+                reversals = [cp for cp in all_checkpoints if cp.get('is_reversal', False)]
+            elif 'reversals' in reversal_cache:
+                # Old format (during migration)
+                reversals = [r for r in reversal_cache.get('reversals', []) if r['time'] > dt_utc]
+                all_checkpoints = reversals  # Old format only had reversals
+            else:
+                reversals = []
+                all_checkpoints = []
         else:
             # Fallback: use old get_azimuth_reversals function
             try:
@@ -506,6 +521,7 @@ def get_next_step(
                     return None
                 base_direction = 1 if latitude > declination else -1
                 reversals = []
+                all_checkpoints = []
             
             # Determine current azimuth direction using reversal cache
             try:
@@ -517,51 +533,50 @@ def get_next_step(
         signed_step = step_value * current_direction
         target_azimuth = (round(current_position / step_value) * step_value + signed_step) % 360
         
-        # Check if any reversal occurs before the calculated target
-        # If so, use the reversal azimuth instead of the step target
-        for i, reversal in enumerate(reversals):
-            reversal_time = reversal['time']
-            reversal_azimuth = reversal['azimuth']
+        # Check if any checkpoint occurs before the calculated target
+        # Checkpoints take priority over step targets to maintain accurate state
+        for checkpoint in all_checkpoints:
+            checkpoint_time = checkpoint['time']
+            checkpoint_azimuth = checkpoint['azimuth']
+            is_reversal = checkpoint.get('is_reversal', True)  # Old format assumes all are reversals
             
-            # Check if we're very close to a reversal point (within 2 degrees)
-            azimuth_distance = abs(current_position - reversal_azimuth)
+            # Check if we're very close to a checkpoint (within 2 degrees)
+            azimuth_distance = abs(current_position - checkpoint_azimuth)
             if azimuth_distance > 180:  # Handle wraparound
                 azimuth_distance = 360 - azimuth_distance
             
-            is_close_to_reversal = azimuth_distance <= 2.0  # Within 2 degrees
+            is_close_to_checkpoint = azimuth_distance <= 2.0  # Within 2 degrees
             
-            # Consider future reversals OR reversals we're very close to
-            if reversal_time > dt_utc or is_close_to_reversal:
-                if is_close_to_reversal:
-                    # Check if reversal blocks the step target
-                    if current_direction == 1:  # Moving positive
-                        # Moving positive: check if reversal is between current and target
-                        if current_position <= target_azimuth:
-                            # No wraparound
-                            blocks = current_position < reversal_azimuth < target_azimuth
-                        else:
-                            # Wraparound case (e.g., 350° -> 10°)
-                            blocks = (reversal_azimuth > current_position) or (reversal_azimuth < target_azimuth)
-                    else:  # Moving negative (current_direction == -1)
-                        # Moving negative: check if reversal is between target and current
-                        if target_azimuth <= current_position:
-                            # No wraparound
-                            blocks = target_azimuth < reversal_azimuth < current_position
-                        else:
-                            # Wraparound case (e.g., 10° -> 350°)
-                            blocks = (reversal_azimuth < current_position) or (reversal_azimuth > target_azimuth)
-                
-                if blocks:
-                    return {
-                        "azimuth": reversal_azimuth,
-                        "reversal": True,
-                        "reversal_time": reversal_time
-                    }
-
-                
-                break  # Only check the next reversal
-            else:
-                continue
+            # Check if checkpoint blocks the step target
+            blocks = False
+            if is_close_to_checkpoint or checkpoint_time > dt_utc:
+                if current_direction == 1:  # Moving positive
+                    # Moving positive: check if checkpoint is between current and target
+                    if current_position <= target_azimuth:
+                        # No wraparound
+                        blocks = current_position < checkpoint_azimuth < target_azimuth
+                    else:
+                        # Wraparound case (e.g., 350° -> 10°)
+                        blocks = (checkpoint_azimuth > current_position) or (checkpoint_azimuth < target_azimuth)
+                else:  # Moving negative (current_direction == -1)
+                    # Moving negative: check if checkpoint is between target and current
+                    if target_azimuth <= current_position:
+                        # No wraparound
+                        blocks = target_azimuth < checkpoint_azimuth < current_position
+                    else:
+                        # Wraparound case (e.g., 10° -> 350°)
+                        blocks = (checkpoint_azimuth < current_position) or (checkpoint_azimuth > target_azimuth)
+            
+            if blocks:
+                # This checkpoint blocks our path - use it as the target
+                return {
+                    "azimuth": checkpoint_azimuth,
+                    "reversal": is_reversal,
+                    "reversal_time": checkpoint_time if is_reversal else None
+                }
+            
+            # Only check the first future checkpoint
+            break
         
         return {
             "azimuth": target_azimuth,
@@ -836,13 +851,27 @@ def get_time_at_azimuth(
     # Get cached reversal data to determine maximum search window
     try:
         if reversal_cache:
-            # Use new cache system - filter to future reversals only
-            reversals = [r for r in reversal_cache.get('reversals', []) if r['time'] > current_dt_utc]
+            # Handle both old and new cache formats during migration
+            if 'checkpoints' in reversal_cache:
+                # New checkpoint format - get ALL future checkpoints (not just reversals)
+                all_checkpoints = [
+                    cp for cp in reversal_cache.get('checkpoints', []) 
+                    if cp['time'] > current_dt_utc
+                ]
+                # Keep reversals list for compatibility
+                reversals = [cp for cp in all_checkpoints if cp.get('is_reversal', False)]
+            elif 'reversals' in reversal_cache:
+                # Old format (during migration)
+                reversals = [r for r in reversal_cache.get('reversals', []) if r['time'] > current_dt_utc]
+                all_checkpoints = reversals  # Old format only had reversals
+            else:
+                reversals = []
+                all_checkpoints = []
             
-            # Find next future reversal (already filtered, so just get first)
-            next_reversal_time = None
-            if reversals:
-                next_reversal_time = reversals[0]['time']
+            # Find next future checkpoint (any type) to cap search window
+            next_checkpoint_time = None
+            if all_checkpoints:
+                next_checkpoint_time = all_checkpoints[0]['time']
         else:
             # Fallback to old system
             current_date = current_dt.date()
@@ -850,18 +879,18 @@ def get_time_at_azimuth(
             reversals = reversal_data.get('reversals', [])
             
             # Find next future reversal
-            next_reversal_time = None
+            next_checkpoint_time = None
             for reversal in sorted(reversals, key=lambda r: r['time']):
                 if reversal['time'] > current_dt_utc:
-                    next_reversal_time = reversal['time']
+                    next_checkpoint_time = reversal['time']
                     break
         
-        # Calculate max search window (cap at next reversal or 24 hours)
-        if next_reversal_time:
-            seconds_until_reversal = (next_reversal_time - current_dt_utc).total_seconds()
-            max_search_seconds = min(24 * 3600, seconds_until_reversal)
+        # Calculate max search window (cap at next checkpoint or 24 hours)
+        if next_checkpoint_time:
+            seconds_until_checkpoint = (next_checkpoint_time - current_dt_utc).total_seconds()
+            max_search_seconds = min(24 * 3600, seconds_until_checkpoint)
         else:
-            max_search_seconds = 24 * 3600  # No reversals, use 24h limit
+            max_search_seconds = 24 * 3600  # No checkpoints, use 24h limit
             
     except Exception as e:
         max_search_seconds = 24 * 3600
