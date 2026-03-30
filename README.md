@@ -1,3 +1,27 @@
+> [!WARNING]
+> ## Warning: Luna final release — Breaking Sol update May 1, 2026
+>
+> This is the **final release** of the current PyEphem-based Luna integration. **Luna is discontinued** and will no longer be maintained. **Please migrate** to **[Sol](https://github.com/okkine/HA-Sol)** — the new Sol tracks the **Sun**, **Moon**, and **planets** in one integration.
+>
+> A fully rewritten version of Sol is scheduled for release on **May 1, 2026**.
+>
+> **What is changing**
+> - The new version replaces PyEphem with a new calculation engine to resolve edge-case instability at certain latitudes.
+> - The update is a **breaking change** — review automations and entity references.
+> - Sun tracking remains central, with expanded support for **Moon** and **planetary** tracking.
+>
+> **Entity naming (examples)**
+> - `sensor.luna_lunar_elevation` -> `sensor.sol_moon_elevation`
+> - `sensor.luna_lunar_azimuth` -> `sensor.sol_moon_azimuth`
+>
+> **Pre-release**
+> A pre-release is available for testing before the May 1 release:
+> **https://github.com/okkine/HA-Sol/releases**
+>
+> If you rely on Luna or Sol in production, please test the pre-release and update automations that reference old entity IDs.
+>
+---
+
 # Luna - Moon Position & Phase Tracking for Home Assistant
 
 Luna is a comprehensive Home Assistant integration that provides precise tracking of the moon's position, phase, and related astronomical events. Built on the robust PyEphem library, it automatically compensates for atmospheric refraction and intelligently schedules updates to provide accurate data exactly when you need it.
