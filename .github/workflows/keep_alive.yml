@@ -1,0 +1,18 @@
+name: Scheduled Job
+on:
+  schedule:
+    - cron: "0 0 1 * *" # Runs monthly
+
+jobs:
+  cron_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Your actual task steps here
+
+      - name: Prevent GitHub from disabling this workflow
+        uses: liskin/gh-workflow-keepalive@v1
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
